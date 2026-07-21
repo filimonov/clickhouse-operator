@@ -30,6 +30,10 @@ func NewFilesGeneratorDomain(configGenerator *Generator) *FilesGeneratorDomain {
 
 func (c *FilesGeneratorDomain) CreateConfigFilesGroupCommon(configSections map[string]string, options *FilesGeneratorOptions) {
 	util.IncludeNonEmpty(configSections, createConfigSectionFilename(configRaft), c.configGenerator.getRaftConfig(options.GetRaftOptions()))
+	// Version-gated coordination settings (async_replication, use_xid_64) that
+	// the static default config must not ship unconditionally, since older
+	// Keeper versions CrashLoop on them. See Generator.getCoordinationSettings.
+	util.IncludeNonEmpty(configSections, createConfigSectionFilename(configCoordination), c.configGenerator.getCoordinationSettings())
 	// Plaintext-port removal must live in the common dir (keeper_config.d) to
 	// win the merge against the static <tcp_port> shipped there; see
 	// Generator.getPlaintextListenerRemoval.

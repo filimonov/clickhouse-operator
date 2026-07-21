@@ -76,6 +76,11 @@ const (
 	configRaft      = "raft"
 	configSettings  = "settings"
 	configListeners = "listeners"
+	// configCoordination is the common-group (keeper_config.d) overlay carrying
+	// version-gated coordination settings (async_replication, use_xid_64) that
+	// are unsafe to ship in the static default config for older Keeper versions.
+	// See Generator.getCoordinationSettings.
+	configCoordination = "coordination"
 	// configListenersCommon is the common-group (keeper_config.d) overlay that
 	// removes the static plaintext <tcp_port>; it must live alongside the
 	// definition it deletes, not in the per-host conf.d. See

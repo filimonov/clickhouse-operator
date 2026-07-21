@@ -20,10 +20,29 @@ import (
 
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
 	chi "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+	"github.com/altinity/clickhouse-operator/pkg/apis/common/types"
+	"github.com/altinity/clickhouse-operator/pkg/apis/swversion"
 	"github.com/altinity/clickhouse-operator/pkg/interfaces"
 	"github.com/altinity/clickhouse-operator/pkg/model/common/config"
 	"github.com/altinity/clickhouse-operator/pkg/util"
 )
+
+// keeperGatedCoordinationSettings lists coordination settings that older
+// ClickHouse Keeper releases do not recognize. Emitting one to a Keeper that
+// predates it makes Keeper reject the whole config with UNKNOWN_SETTING and
+// CrashLoop before it ever listens, so each is gated behind the minimum Keeper
+// version that supports it. Boundaries verified against ClickHouse source
+// (src/Coordination/CoordinationSettings) and live pods:
+//   - async_replication: absent in 23.8, present from 24.3.
+//   - use_xid_64:        absent in 24.8, present from 24.12.
+var keeperGatedCoordinationSettings = []struct {
+	name       string
+	value      string
+	minVersion string
+}{
+	{name: "async_replication", value: "1", minVersion: "24.3"},
+	{name: "use_xid_64", value: "1", minVersion: "24.12"},
+}
 
 // Generator generates configuration files content for specified CR
 // Configuration files content is an XML ATM, so config generator provides set of Get*() functions
@@ -88,6 +107,9 @@ func (c *Generator) getRaftConfig(selector *config.HostSelector) string {
 			util.Iline(raft, i, "    <id>%d</id>", getServerId(host))
 			util.Iline(raft, i, "    <hostname>%s</hostname>", c.namer.Name(interfaces.NameInstanceHostname, host))
 			util.Iline(raft, i, "    <port>%d</port>", host.RaftPort.Value())
+			if isJoiningEstablishedCluster(c.cr, host) {
+				util.Iline(raft, i, "    <start_as_follower>true</start_as_follower>")
+			}
 			if host.IsSecure() {
 				util.Iline(raft, i, "    <secure>1</secure>")
 			}
@@ -99,6 +121,64 @@ func (c *Generator) getRaftConfig(selector *config.HostSelector) string {
 	})
 
 	return chi.NewSettings().Set("keeper_server/raft_configuration", chi.MustNewSettingScalarFromAny(raft).SetEmbed()).ClickHouseConfig()
+}
+
+// getCoordinationSettings emits the version-gated coordination settings
+// (keeperGatedCoordinationSettings) that are unsafe to ship in the static
+// default config for older Keeper versions. A setting is included only when the
+// cluster's minimum Keeper version is known to support it; when the version is
+// unknown or "latest" the minimum resolves to MaxVersion and every gated
+// setting is emitted, preserving the prior always-on behavior. Returns "" when
+// nothing is emitted (e.g. every host runs a Keeper too old for any of them).
+func (c *Generator) getCoordinationSettings() string {
+	minVersion := c.minKeeperVersion()
+
+	// getHostSoftwareVersion resolves any unparseable image tag (head,
+	// digest-pinned, bare major, custom names, etc) to swversion.MinVersion()
+	// (0.0.1) rather than nil, so minVersion is "known" even when the actual
+	// Keeper version is unresolved. Treat that sentinel as unresolved too —
+	// only a genuinely known, non-sentinel version can gate a setting off.
+	versionResolved := minVersion.IsKnown() && minVersion.Cmp(swversion.MinVersion()) != 0
+
+	// Indent 12 = 3rd level (clickhouse/keeper_server/coordination_settings),
+	// matching getRaftConfig's convention for the analogous depth.
+	i := 12
+	body := &bytes.Buffer{}
+	emitted := false
+	for _, s := range keeperGatedCoordinationSettings {
+		if versionResolved && !minVersion.Matches(">= "+s.minVersion) {
+			// A host runs a Keeper predating this setting — omit it so the pod
+			// starts instead of crashing on UNKNOWN_SETTING.
+			log.V(1).M(c.cr).Info("SKIP coordination setting %s (min keeper version %s < %s)",
+				s.name, minVersion.Render(), s.minVersion)
+			continue
+		}
+		util.Iline(body, i, "<%s>%s</%s>", s.name, s.value, s.name)
+		emitted = true
+	}
+	if !emitted {
+		return ""
+	}
+
+	return chi.NewSettings().
+		Set("keeper_server/coordination_settings", chi.MustNewSettingScalarFromAny(body).SetEmbed()).
+		ClickHouseConfig()
+}
+
+// minKeeperVersion returns the lowest Keeper version across the CR's hosts,
+// mirroring ClickHouseKeeperInstallation.FindMinMaxVersions: an unknown host
+// version does not lower the minimum (Cmp returns 0 for unknown), so a CR whose
+// tags are all unknown or "latest" yields MaxVersion, and every gated setting
+// is emitted.
+func (c *Generator) minKeeperVersion() *swversion.SoftWareVersion {
+	minVersion := swversion.MaxVersion()
+	c.cr.WalkHosts(func(host *chi.Host) error {
+		if host.Runtime.Version.Cmp(minVersion) < 0 {
+			minVersion = host.Runtime.Version
+		}
+		return nil
+	})
+	return minVersion
 }
 
 // getHostServerId builds server id config for the host
@@ -187,4 +267,22 @@ func (c *Generator) getPlaintextListenerRemoval() string {
 
 func getServerId(host *chi.Host) int {
 	return host.GetRuntime().GetAddress().GetReplicaIndex()
+}
+
+// isJoiningEstablishedCluster reports whether the host is a newly requested
+// member being added to a cluster that already has established members.
+// Such a host must not initiate elections on first boot (split-brain guard,
+// see docs/chk-rescale-raft-safety-v3.md, Fact 3). On fresh-cluster bootstrap
+// (all hosts new) the flag must NOT be emitted: NuRaft requires at least one
+// server able to start as leader.
+func isJoiningEstablishedCluster(cr chi.ICustomResource, host *chi.Host) bool {
+	if !host.GetReconcileAttributes().GetStatus().Is(types.ObjectStatusRequested) {
+		return false
+	}
+	// "Established" is keyed off the CR ancestor (the cluster already existed on a
+	// prior successful reconcile), NOT off mutable per-host statuses, which flip
+	// during the sequential host loop and would make a fresh multi-node bootstrap
+	// mis-emit start_as_follower on a later host — NuRaft forbids all-followers.
+	// See api.CRHasEstablishedCluster.
+	return chi.CRHasEstablishedCluster(cr)
 }
