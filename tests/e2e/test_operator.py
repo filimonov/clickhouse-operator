@@ -3,6 +3,8 @@ import time
 import yaml
 import threading
 import re
+import subprocess
+import uuid
 
 from e2e.retry_sleep import retry_sleep
 
@@ -7287,6 +7289,50 @@ def test_020003_2(self):
         delete_test_namespace()
 
 
+def keeper_pod_name(chk, replica):
+    return f"chk-{chk}-keeper-0-{replica}-0"
+
+
+def get_keeper_raft_members(chk, replica):
+    """Committed raft member ids as seen by one keeper pod via /keeper/config."""
+    out = kubectl.launch(
+        f"exec {keeper_pod_name(chk, replica)} -- "
+        f"clickhouse-keeper-client -p 2181 -q \"get '/keeper/config'\"",
+        ok_to_fail=True,
+    )
+    return sorted(
+        int(line.split("=")[0].split(".")[1])
+        for line in out.splitlines()
+        if line.startswith("server.")
+    )
+
+
+def get_keeper_mode(chk, replica):
+    out = kubectl.launch(
+        f"exec {keeper_pod_name(chk, replica)} -- bash -c "
+        f"\"exec 3<>/dev/tcp/127.0.0.1/2181; printf srvr >&3; timeout 3 cat <&3\"",
+        ok_to_fail=True,
+    )
+    for line in out.splitlines():
+        if line.startswith("Mode: "):
+            return line[len("Mode: "):].strip()
+    return "unknown"
+
+
+def check_keeper_membership(chk, expected_ids, note=""):
+    """Every expected member must report exactly the expected committed set,
+    and exactly one of them must be leader/standalone."""
+    with Then(f"keeper committed membership is {expected_ids} {note}"):
+        for i in expected_ids:
+            for attempt in retries(timeout=300, delay=10):
+                with attempt:
+                    members = get_keeper_raft_members(chk, i)
+                    assert members == sorted(expected_ids), \
+                        f"pod {i} reports raft members {members}, expected {sorted(expected_ids)}"
+        leaders = [i for i in expected_ids if get_keeper_mode(chk, i) in ("leader", "standalone")]
+        assert len(leaders) == 1, f"expected exactly one leader, got {leaders}"
+
+
 @TestScenario
 @Tags("HEAVY")
 @Name("test_020005. Clickhouse-keeper scale-up/scale-down")
@@ -7312,6 +7358,8 @@ def test_020005(self):
             },
         )
 
+    check_keeper_membership(chk, [0], note="after install")
+
     with Given("CHI with 2 replicas"):
         kubectl.create_and_check(
             manifest=chi_manifest,
@@ -7331,6 +7379,8 @@ def test_020005(self):
                 "do_not_delete": 1,
             },
         )
+
+    check_keeper_membership(chk, [0, 1, 2], note="after scale-up")
 
     check_replication(chi, {0, 1}, 2)
 
@@ -7370,10 +7420,387 @@ def test_020005(self):
             },
         )
 
+    check_keeper_membership(chk, [0], note="after scale-down")
+
     check_replication(chi, {0, 1}, 5)
 
     with Finally("I clean up"):
         delete_test_namespace()
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_020005_1. Clickhouse-keeper scale-down blocks safely without quorum")
+def test_020005_1(self):
+    """Scale-down must not delete pods while removals cannot be committed."""
+    create_shell_namespace_clickhouse_template()
+
+    chk_manifest_3 = "manifests/chk/test-052-chk-rescale-3.yaml"
+    chk = yaml_manifest.get_name(util.get_full_path(chk_manifest_3))
+
+    with Given("Install 3-replica CHK"):
+        kubectl.create_and_check(
+            manifest=chk_manifest_3, kind="chk",
+            check={"pod_count": 3, "do_not_delete": 1},
+        )
+    check_keeper_membership(chk, [0, 1, 2], note="after install")
+
+    with When("Two of three keepers are down (no quorum for removal commit)"):
+        with When("keepers 1 and 2 are deleted"):
+            kubectl.launch(f"delete pod {keeper_pod_name(chk, 1)} {keeper_pod_name(chk, 2)} --wait=false")
+        with And("Scale-down is requested while quorum is unavailable"):
+            # Apply directly (not create_and_check) -- the operator is expected to
+            # block on the removal barrier and never reach status Completed here.
+            kubectl.launch(f"apply -f {util.get_full_path('manifests/chk/test-052-chk-rescale-1.yaml')}", ok_to_fail=True)
+
+    with Then("Operator does not delete the STS of members whose removal is not committed"):
+        # The scale-down barrier holds while removals cannot commit; STSs stay.
+        time.sleep(60)
+        sts_count = kubectl.get_count("sts", chk=chk)
+        assert sts_count == 3, f"expected 3 STS while removal is not committed, got {sts_count}"
+
+    with Finally("I clean up"):
+        delete_test_namespace()
+
+
+def chk_manifest_with_keeper_version(base_manifest, version):
+    """Copy a CHK manifest replacing the keeper image tag; returns temp path."""
+    src = util.get_full_path(base_manifest)
+    dst = f"/tmp/{os.path.basename(base_manifest).replace('.yaml', '')}-{version.replace('.', '_')}.yaml"
+    with open(src) as f:
+        content = f.read()
+    content = content.replace(
+        "clickhouse/clickhouse-keeper:25.8", f"clickhouse/clickhouse-keeper:{version}"
+    )
+    with open(dst, "w") as f:
+        f.write(content)
+    return dst
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_020005_2. Keeper rescale across supported keeper versions")
+def test_020005_2(self):
+    """1 -> 3 -> 1 membership flow across supported keeper versions, proving
+    full rescale-to-Completed correctness (not just split-brain prevention,
+    which test_020005_3 covers separately down to 23.8).
+
+    Floor here is 24.8, not 23.8. 24.8 used to crash-loop on startup (rejected
+    the `use_xid_64` coordination setting with UNKNOWN_SETTING -- a pre-existing
+    operator/config incompatibility predating this branch); the operator now
+    version-gates that setting, so 24.8 boots and completes a full 1->3->1
+    rescale cleanly. 23.8 is intentionally excluded from this rescale matrix:
+    its readiness probe (HTTP :9182 / http_control, absent before 24.3) never
+    passes, so the pod is never Ready and StatefulSet updates churn -- managed
+    rescale-to-Completed is unreliable there (documented in
+    docs/chk-rescale-raft-safety-v3.md; 23.8 remains safety-covered by
+    test_020005_3). 24.12 is the oldest leg exercised here."""
+    failures = []
+    for version in ["24.8", "24.12", "25.8"]:
+        # Check is just Test(subtype=Check) -- it does NOT isolate a failure from
+        # the enclosing for loop on its own; a bare `with Check(...)` lets an
+        # AssertionError propagate straight out of this function, aborting the
+        # remaining version legs. Catching here is what makes each version run
+        # (and report) independently; Check already recorded the Fail internally
+        # before re-raising. The exception is NOT swallowed, though -- it is
+        # collected into `failures` and re-asserted after the loop, so the
+        # scenario's overall verdict stays honest (red iff any version failed).
+        try:
+            with Check(f"keeper {version}"):
+                try:
+                    create_shell_namespace_clickhouse_template()
+                    m1 = chk_manifest_with_keeper_version("manifests/chk/test-052-chk-rescale-1.yaml", version)
+                    m3 = chk_manifest_with_keeper_version("manifests/chk/test-052-chk-rescale-3.yaml", version)
+                    chk = yaml_manifest.get_name(m1)
+                    kubectl.create_and_check(manifest=m1, kind="chk", check={"pod_count": 1, "do_not_delete": 1})
+                    check_keeper_membership(chk, [0], note=f"install {version}")
+                    kubectl.create_and_check(manifest=m3, kind="chk", check={"pod_count": 3, "do_not_delete": 1})
+                    check_keeper_membership(chk, [0, 1, 2], note=f"scale-up {version}")
+                    kubectl.create_and_check(manifest=m1, kind="chk", check={"pod_count": 1, "do_not_delete": 1})
+                    check_keeper_membership(chk, [0], note=f"scale-down {version}")
+                finally:
+                    delete_test_namespace()
+        except Exception as e:
+            failures.append((version, str(e)))
+
+    assert not failures, f"failed for versions: {failures}"
+
+
+# --- test_020005_3 split-brain injection helpers -----------------------------
+#
+# The minikube docker driver runs the cluster's single node as a container
+# named "minikube"; pod-to-pod traffic crosses its CNI bridge and is subject to
+# bridge-netfilter (net.bridge.bridge-nf-call-iptables=1 on this setup), so a
+# node-level iptables DROP on one pod's IP in FORWARD partitions it from every
+# other pod while leaving `kubectl exec` (routed through the API server/kubelet
+# to the container runtime, not over the pod network) and in-pod
+# /dev/tcp/127.0.0.1 probes unaffected. NetworkPolicy is not used because the
+# default minikube CNI does not enforce it.
+_SPLIT_BRAIN_PARTITION_CHAIN = "CHK-TEST-PARTITION"
+
+
+def _node_iptables(*args):
+    """Run iptables inside the minikube node container."""
+    return subprocess.run(
+        ["docker", "exec", "minikube", "iptables"] + list(args),
+        capture_output=True, text=True, check=False,
+    )
+
+
+def partition_pod_traffic(pod_ip):
+    """Drop all FORWARD traffic to/from pod_ip at the node level, both directions."""
+    _node_iptables("-N", _SPLIT_BRAIN_PARTITION_CHAIN)  # may already exist; ignore failure
+    _node_iptables("-F", _SPLIT_BRAIN_PARTITION_CHAIN)
+    _node_iptables("-A", _SPLIT_BRAIN_PARTITION_CHAIN, "-s", pod_ip, "-j", "DROP")
+    _node_iptables("-A", _SPLIT_BRAIN_PARTITION_CHAIN, "-d", pod_ip, "-j", "DROP")
+    if _node_iptables("-C", "FORWARD", "-j", _SPLIT_BRAIN_PARTITION_CHAIN).returncode != 0:
+        _node_iptables("-I", "FORWARD", "1", "-j", _SPLIT_BRAIN_PARTITION_CHAIN)
+
+
+def heal_partition():
+    """Remove the partition chain from FORWARD and delete it. Safe to call even
+    if partition_pod_traffic was never called (all steps tolerate failure)."""
+    _node_iptables("-D", "FORWARD", "-j", _SPLIT_BRAIN_PARTITION_CHAIN)
+    _node_iptables("-F", _SPLIT_BRAIN_PARTITION_CHAIN)
+    _node_iptables("-X", _SPLIT_BRAIN_PARTITION_CHAIN)
+
+
+def keeper_exec_raw(pod, query, ns, kubectl_cmd=None):
+    """Direct kubectl exec via subprocess, preserving the real process exit code.
+    (kubectl.launch's ok_to_fail path only returns command output, not the exit
+    code, which this test needs to judge a concurrent write race.)
+
+    kubectl_cmd: pre-resolved kubectl command list. testflows' current() is only
+    valid on threads testflows itself manages -- a plain threading.Thread (as
+    used by concurrent_keeper_writes below) sees current() return None, so
+    callers racing this from their own threads MUST resolve kubectl_cmd on the
+    calling thread first and pass it in; only single-threaded callers may omit it."""
+    if kubectl_cmd is None:
+        kubectl_cmd = current().context.kubectl_cmd.split()
+    try:
+        result = subprocess.run(
+            kubectl_cmd + [
+                "--namespace", ns, "exec", pod, "--",
+                "clickhouse-keeper-client", "-p", "2181", "-q", query,
+            ],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        return result.returncode, (result.stdout or "") + (result.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        return 1, f"timeout: {e}"
+    except OSError as e:
+        return 1, f"exec failed: {e}"
+
+
+def tcp_reachable(pod, ip, port, ns, timeout=3):
+    """True if `pod` can open a TCP connection to ip:port (via kubectl exec,
+    which bypasses the pod network -- used here to independently verify a
+    network partition from the OTHER side, not just assert it was requested)."""
+    kubectl_cmd = current().context.kubectl_cmd.split()
+    try:
+        result = subprocess.run(
+            kubectl_cmd + [
+                "--namespace", ns, "exec", pod, "--", "bash", "-c",
+                f"exec 3<>/dev/tcp/{ip}/{port} && echo OPEN || echo CLOSED",
+            ],
+            capture_output=True, text=True, timeout=timeout + 5, check=False,
+        )
+        return result.returncode == 0 and "OPEN" in result.stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def keeper_create_compat(pod, path, value, ns, kubectl_cmd=None):
+    """Create a znode, tolerating clickhouse-keeper-client's version-dependent
+    quoting grammar: 23.8's parser only accepts bare tokens (`create /path
+    value`) and errors on quoted string literals; 24.8+ requires quoted string
+    literals (`create '/path' 'value'`) and errors on bare paths. Both grammars
+    are mutually exclusive, so trying both is safe -- whichever one this
+    version's parser rejects is a no-op (see keeper_exec_raw: the client exits 0
+    even on a syntax error, so neither attempt's exit code/output is trustworthy
+    on its own; only a read-back afterward proves anything committed)."""
+    keeper_exec_raw(pod, f"create '{path}' '{value}'", ns, kubectl_cmd=kubectl_cmd)
+    keeper_exec_raw(pod, f"create {path} {value}", ns, kubectl_cmd=kubectl_cmd)
+
+
+def concurrent_keeper_writes(path, pod_values, ns):
+    """Concurrently write different values to the SAME znode path from
+    different pods (python threads, per pod_values=[(pod, value), ...]), then
+    read back the path from EACH pod's own perspective afterward.
+
+    Success is judged ONLY by this read-back matching the pod's own perspective
+    -- never by the create call's exit code, which clickhouse-keeper-client sets
+    to 0 even for a syntax error or a logical error like "node doesn't exist"
+    (only a genuine connection failure yields a nonzero exit). Returns
+    {pod: committed_value_or_empty_string}; the caller compares these to detect
+    a real split-brain (two DIFFERENT non-empty committed values) as opposed to
+    a merely-absent/malformed write (empty string, safe)."""
+    # Resolve on THIS (testflows-managed) thread -- see keeper_exec_raw's
+    # docstring for why the worker threads below cannot call current() themselves.
+    kubectl_cmd = current().context.kubectl_cmd.split()
+    errors = {}
+
+    def worker(pod, value):
+        try:
+            keeper_create_compat(pod, path, value, ns, kubectl_cmd=kubectl_cmd)
+        except Exception as e:
+            errors[pod] = e
+
+    threads = [threading.Thread(target=worker, args=(pod, value)) for pod, value in pod_values]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise RuntimeError(f"concurrent_keeper_writes: worker thread(s) raised: {errors}")
+
+    committed = {}
+    for pod, _ in pod_values:
+        _, out = keeper_exec_raw(pod, f"get '{path}'", ns, kubectl_cmd=kubectl_cmd)
+        out = out.strip()
+        # A missing node or any client-side error message never equals a value
+        # we actually wrote ("old"/"new"), so this filter needs no special-casing
+        # of clickhouse-keeper-client's various error strings.
+        committed[pod] = out if out in {value for _, value in pod_values} else ""
+    return committed
+
+
+@TestScenario
+@Tags("HEAVY")
+@Name("test_020005_3. Split-brain demonstration: at most one write quorum during unsafe rescale")
+def test_020005_3(self):
+    """Deterministically prove the original defect (two concurrently committing
+    raft quorums while scaling up) cannot occur, across keeper versions: partition
+    pod0's pod-network traffic BEFORE requesting scale-up, apply the 3-replica
+    manifest raw (a safe operator may legitimately never complete it while pod0 is
+    unreachable), then race conflicting writes from pod0 and pod1 (if it ever
+    appears). At most one write may commit, and every reachable pod must read back
+    the same value."""
+    failures = []
+    for version in ["23.8", "24.8", "25.8"]:
+        # Check is just Test(subtype=Check) -- it does NOT isolate a failure from
+        # the enclosing for loop on its own; a bare `with Check(...)` lets an
+        # AssertionError propagate straight out of this function, aborting the
+        # remaining version legs (this is what happened when the split-brain
+        # assertion fired on the 23.8 leg: the whole scenario stopped at 2m48s,
+        # 24.8/25.8 never ran). Catching here is what makes each version run
+        # (and report) independently; Check already recorded the Fail internally
+        # before re-raising. The exception is NOT swallowed, though -- it is
+        # collected into `failures` and re-asserted after the loop, so the
+        # scenario's overall verdict stays honest (red iff any version failed)
+        # instead of every leg's outcome silently rolling up to a green no-op.
+        try:
+            with Check(f"keeper {version}"):
+                create_shell_namespace_clickhouse_template()
+                ns = current().context.test_namespace
+
+                m1 = chk_manifest_with_keeper_version("manifests/chk/test-052-chk-rescale-1.yaml", version)
+                m3 = chk_manifest_with_keeper_version("manifests/chk/test-052-chk-rescale-3.yaml", version)
+                chk = yaml_manifest.get_name(m1)
+
+                try:
+                    with Given(f"Install 1-replica CHK ({version})"):
+                        kubectl.create_and_check(
+                            manifest=m1, kind="chk",
+                            check={"pod_count": 1, "do_not_delete": 1},
+                        )
+                    check_keeper_membership(chk, [0], note=f"after install {version}")
+
+                    pod0 = keeper_pod_name(chk, 0)
+                    pod0_ip = kubectl.get_field("pod", pod0, ".status.podIP", ns=ns)
+
+                    with When(f"pod0 ({pod0_ip}) is partitioned from all other pod traffic"):
+                        partition_pod_traffic(pod0_ip)
+
+                    with And("3-replica manifest is applied raw (a safe operator may never complete this)"):
+                        kubectl.launch(f"apply -f {m3}", ok_to_fail=True, ns=ns)
+
+                    with And("Bounded wait (up to 3 min) for BOTH pod1 and pod2 to appear; absence is tolerated"):
+                        # A lone, leaderless pod1 refuses writes in ~2s, which would make the
+                        # write race pass vacuously (nothing is actually contesting quorum).
+                        # Only a fully formed {1,2} pair can elect a leader and pose a real
+                        # second write quorum, so both must be up before we even look for one.
+                        pod1 = keeper_pod_name(chk, 1)
+                        pod2 = keeper_pod_name(chk, 2)
+                        deadline = time.time() + 180
+                        pod1_running = pod2_running = False
+                        while time.time() < deadline and not (pod1_running and pod2_running):
+                            pod1_running = kubectl.get_field("pod", pod1, ".status.phase", ns=ns) == "Running"
+                            pod2_running = kubectl.get_field("pod", pod2, ".status.phase", ns=ns) == "Running"
+                            if not (pod1_running and pod2_running):
+                                time.sleep(10)
+                        note(f"[{version}] pod1 running: {pod1_running}, pod2 running: {pod2_running}")
+
+                    if pod1_running:
+                        with And("Verify the partition is real: pod1 must NOT reach pod0 on raft (9444) or client (2181) ports"):
+                            # Independent confirmation from the OTHER side of the partition --
+                            # not just "we ran the DROP command", but "the other pod actually
+                            # cannot connect". A false negative here (partition not actually
+                            # blocking) would invalidate the whole demonstration.
+                            raft_reachable = tcp_reachable(pod1, pod0_ip, 9444, ns)
+                            client_reachable = tcp_reachable(pod1, pod0_ip, 2181, ns)
+                            note(f"[{version}] pod1 -> pod0:9444 reachable: {raft_reachable} (expected False)")
+                            note(f"[{version}] pod1 -> pod0:2181 reachable: {client_reachable} (expected False)")
+                            assert not raft_reachable, \
+                                f"partition is not effective: pod1 can still reach pod0 raft port ({pod0_ip}:9444)"
+                            assert not client_reachable, \
+                                f"partition is not effective: pod1 can still reach pod0 client port ({pod0_ip}:2181)"
+
+                    with And("Dump keeper state on every side before racing (diagnostic evidence)"):
+                        note(f"[{version}] pod0 mode: {get_keeper_mode(chk, 0)}")
+                        note(f"[{version}] pod0 /keeper/config: {get_keeper_raft_members(chk, 0)}")
+                        if pod1_running:
+                            note(f"[{version}] pod1 mode: {get_keeper_mode(chk, 1)}")
+                            note(f"[{version}] pod1 /keeper/config: {get_keeper_raft_members(chk, 1)}")
+                        if pod2_running:
+                            note(f"[{version}] pod2 mode: {get_keeper_mode(chk, 2)}")
+                            note(f"[{version}] pod2 /keeper/config: {get_keeper_raft_members(chk, 2)}")
+
+                    leader_replica = None
+                    if pod1_running and pod2_running:
+                        with And("Bounded wait (up to 2 min) for a leader to emerge among pod1/pod2"):
+                            # Only once {1,2} has elected a leader does that side hold an
+                            # actual, functioning write quorum -- racing before that would
+                            # again be vacuous (no side capable of committing yet).
+                            deadline = time.time() + 120
+                            while time.time() < deadline and leader_replica is None:
+                                for i in (1, 2):
+                                    if get_keeper_mode(chk, i) in ("leader", "standalone"):
+                                        leader_replica = i
+                                        break
+                                if leader_replica is None:
+                                    time.sleep(5)
+                            note(f"[{version}] leader among pod1/pod2: {leader_replica}")
+
+                    with Then("At most one side's write is ever committed, cluster-wide"):
+                        note(f"[{version}] pod0 mode at race time: {get_keeper_mode(chk, 0)}")
+                        znode = f"/rescale-safety-{uuid.uuid4().hex}"
+                        pod_values = [(pod0, "old")]
+                        if leader_replica is not None:
+                            pod_values.append((keeper_pod_name(chk, leader_replica), "new"))
+                        else:
+                            note(f"[{version}] no leader emerged among pod1/pod2 within the bounded window -- "
+                                 "racing pod0 alone (expected outcome for a safe operator)")
+
+                        # Judged by read-back, never by exit code: clickhouse-keeper-client
+                        # exits 0 even on a syntax error or "node doesn't exist" (see
+                        # concurrent_keeper_writes/keeper_create_compat docstrings) --
+                        # only a value that reads back matching what a side wrote counts
+                        # as that side's write having actually committed.
+                        committed = concurrent_keeper_writes(znode, pod_values, ns)
+                        note(f"[{version}] committed values (read back per pod): {committed}")
+                        distinct_committed = {v for v in committed.values() if v}
+                        assert len(distinct_committed) <= 1, \
+                            f"[{version}] two different values committed -- split-brain: {committed}"
+                finally:
+                    with Finally("Heal the network partition"):
+                        heal_partition()
+                    with Finally("I clean up"):
+                        delete_test_namespace()
+        except Exception as e:
+            failures.append((version, str(e)))
+
+    assert not failures, f"split-brain reproduced for: {failures}"
 
 
 @TestScenario

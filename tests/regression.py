@@ -8,7 +8,6 @@ from requirements.requirements import *
 xfails = {
     # test_operator.py
     "/regression/e2e.test_operator/test_010021*": [(Fail, "Storage test is flaky on github")],
-    "/regression/e2e.test_operator/test_020005*": [(Fail, "Keeper scale-up/scale-down is flaky")],
 }
 
 
