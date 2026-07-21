@@ -1,13 +1,20 @@
 <clickhouse>
     <asynchronous_metrics_keeper_metrics_only>1</asynchronous_metrics_keeper_metrics_only>
     <keeper_server>
+        <!--
+            async_replication and use_xid_64 are intentionally NOT set here.
+            They are version-gated coordination settings: older ClickHouse Keeper
+            releases reject them with UNKNOWN_SETTING and CrashLoop at startup
+            (async_replication: absent before 24.3; use_xid_64: absent before 24.12).
+            The operator emits them per-CR from the config generator, only for
+            Keeper versions known to support them. See
+            pkg/model/chk/config/generator.go getCoordinationSettings.
+        -->
         <coordination_settings>
-            <async_replication>1</async_replication>
             <min_session_timeout_ms>10000</min_session_timeout_ms>
             <operation_timeout_ms>10000</operation_timeout_ms>
             <raft_logs_level>information</raft_logs_level>
             <session_timeout_ms>100000</session_timeout_ms>
-            <use_xid_64>1</use_xid_64>
         </coordination_settings>
         <hostname_checks_enabled>true</hostname_checks_enabled>
         <log_storage_path>/var/lib/clickhouse-keeper/coordination/logs</log_storage_path>
@@ -29,7 +36,7 @@
             stricter list can override this value, but they must keep `ruok` if they
             also use the default operator probes.
         -->
-        <four_letter_word_white_list>conf,cons,crst,envi,ruok,srst,srvr,stat,wchs,dirs,mntr,isro</four_letter_word_white_list>
+        <four_letter_word_white_list>conf,cons,crst,envi,ruok,srst,srvr,stat,wchs,dirs,mntr,isro,rqld</four_letter_word_white_list>
     </keeper_server>
     <listen_host>::</listen_host>
     <listen_host>0.0.0.0</listen_host>
