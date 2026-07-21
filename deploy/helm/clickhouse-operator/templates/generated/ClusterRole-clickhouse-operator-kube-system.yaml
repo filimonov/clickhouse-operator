@@ -75,6 +75,21 @@ rules:
       - get
       - list
   #
+  # coordination.k8s.io resources
+  #
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  #
   # apps.* resources
   #
   - apiGroups:
